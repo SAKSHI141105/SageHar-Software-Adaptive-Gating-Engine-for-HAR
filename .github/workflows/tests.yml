@@ -1,0 +1,25 @@
+name: Tests
+
+"on":
+  push:
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      # data/raw/uci_har (61MB) and data/processed/har_cnn_uci.pt/.onnx are
+      # committed to the repo, so the checkout above already has everything
+      # tests/test_train.py, tests/test_export_onnx.py, and
+      # tests/test_evaluate_real.py need -- no dataset download step here.
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run test suite
+        run: python -m pytest tests/ -v
