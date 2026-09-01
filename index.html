@@ -1,0 +1,1261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>SAGE-HAR :: Gate Workbench</title>
+
+<!--
+  index.html
+  ==========
+  Single-file SAGE-HAR dashboard. No build step, no external JS modules,
+  no npm packages -- just open this file directly in a browser (or
+  double-click it) and it runs.
+
+  Structure of this file:
+    1. <style>  -- the whole visual design system (dark instrument theme).
+    2. <body>   -- the workbench layout (metrics bar, oscilloscope,
+                   control panel, terminal log).
+    3. <script> -- the SAGE-HAR gate logic (mirrors sage_gate.py exactly),
+                   a synthetic sensor simulator, and the canvas renderer.
+                   Everything runs on a single requestAnimationFrame loop
+                   on the main thread -- no Web Worker -- so this file
+                   works even when opened as a plain file:// URL.
+-->
+
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap');
+
+  :root {
+    --bg-0: #0a0a0a;
+    --bg-1: #111111;
+    --bg-2: #161616;
+    --line: #262626;
+    --line-2: #333333;
+    --text-0: #ededed;
+    --text-1: #a3a3a3;
+    --text-2: #6b6b6b;
+
+    --amber: #f59e0b;
+    --red: #ef4444;
+    --blue: #3b82f6;
+    --teal: #10b981;
+    --teal-tint: rgba(16, 185, 129, 0.08);
+
+    --font-mono: 'JetBrains Mono', 'Fira Code', Consolas, monospace;
+    --font-sans: 'Inter', system-ui, -apple-system, sans-serif;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    background: var(--bg-0);
+    color: var(--text-0);
+    font-family: var(--font-sans);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .app {
+    display: flex;
+    flex-direction: column;
+    max-width: 1480px;
+    margin: 0 auto;
+    padding: 16px;
+    gap: 12px;
+    min-height: 100vh;
+  }
+
+  /* ---------------- topbar ---------------- */
+  .topbar {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--line);
+  }
+  .brand-mark { font-family: var(--font-mono); font-weight: 700; font-size: 16px; }
+  .brand-sub { font-family: var(--font-mono); font-size: 11px; color: var(--text-2); margin-left: 10px; }
+
+  .status-chip {
+    display: flex; align-items: center; gap: 7px;
+    padding: 5px 10px; border: 1px solid var(--line); background: var(--bg-1);
+    font-family: var(--font-mono); font-size: 11px; font-weight: 600; border-radius: 3px;
+  }
+  .status-led { width: 7px; height: 7px; border-radius: 50%; background: var(--text-2); }
+  .status-chip.active { color: var(--teal); border-color: rgba(16,185,129,.35); background: var(--teal-tint); }
+  .status-chip.active .status-led { background: var(--teal); }
+  .status-chip.inactive { color: var(--text-1); }
+
+  /* ---------------- metrics bar (htop style) ---------------- */
+  .metrics-bar {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    background: var(--bg-1);
+    overflow: hidden;
+  }
+  .metric { padding: 10px 14px; border-right: 1px solid var(--line); }
+  .metric:last-child { border-right: none; }
+  .metric-key { font-family: var(--font-mono); font-size: 10px; color: var(--text-2); letter-spacing: .4px; margin-bottom: 5px; }
+  .metric-val { font-family: var(--font-mono); font-size: 20px; font-weight: 600; }
+  .metric-val.teal { color: var(--teal); }
+  .metric-val.amber { color: var(--amber); }
+
+  /* ---------------- workbench grid ---------------- */
+  .workbench {
+    display: grid;
+    grid-template-columns: 2fr 1fr;
+    grid-template-rows: 360px minmax(0, 1fr);
+    gap: 12px;
+    flex: 1;
+    min-height: 0;
+  }
+  .scope-pane { grid-column: 1; grid-row: 1; }
+  .terminal-pane { grid-column: 1; grid-row: 2; }
+  .control-pane { grid-column: 2; grid-row: 1 / span 2; }
+
+  .pane {
+    background: var(--bg-1);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 12px 14px;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+  .pane-header {
+    display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px;
+    margin-bottom: 10px; padding-bottom: 8px; border-bottom: 1px solid var(--line);
+  }
+  .pane-header h2 { font-family: var(--font-mono); font-size: 11px; color: var(--text-1); margin: 0; letter-spacing: .5px; }
+
+  .legend { display: flex; gap: 12px; flex-wrap: wrap; }
+  .legend-item { display: flex; align-items: center; gap: 5px; font-size: 10px; color: var(--text-2); font-family: var(--font-mono); }
+  .swatch { display: inline-block; width: 11px; height: 2px; }
+  .swatch-var { background: var(--amber); }
+  .swatch-hi { background: repeating-linear-gradient(90deg, var(--red) 0 3px, transparent 3px 5px); }
+  .swatch-lo { background: repeating-linear-gradient(90deg, var(--blue) 0 3px, transparent 3px 5px); }
+  .swatch-active { background: var(--teal-tint); border: 1px solid var(--teal); height: 8px; }
+
+  #scope { flex: 1; min-height: 0; width: 100%; background: var(--bg-0); border: 1px solid var(--line); border-radius: 2px; }
+
+  /* ---------------- terminal log ---------------- */
+  #terminal {
+    flex: 1; min-height: 0; overflow-y: auto;
+    background: var(--bg-0); border: 1px solid var(--line); border-radius: 2px;
+    padding: 8px 10px; font-family: var(--font-mono); font-size: 11.5px; line-height: 1.65;
+  }
+  .log-line { color: var(--text-1); border-left: 2px solid transparent; padding-left: 6px; }
+  .log-line .tag { font-weight: 700; padding: 0 3px; }
+  .log-line.activate { color: var(--text-0); border-left-color: var(--teal); background: var(--teal-tint); }
+  .log-line.activate .tag { color: var(--teal); }
+  .log-line.deactivate { color: var(--text-0); border-left-color: var(--blue); background: rgba(59,130,246,.07); }
+  .log-line.deactivate .tag { color: var(--blue); }
+  .log-amber { color: var(--amber); }
+  .log-red { color: var(--red); }
+  .log-blue { color: var(--blue); }
+  .log-dim { color: var(--text-2); }
+
+  /* ---------------- control panel ---------------- */
+  .control-pane { overflow-y: auto; }
+  .control-block { margin-bottom: 18px; padding-bottom: 18px; border-bottom: 1px solid var(--line); }
+  .control-block:last-child { border: none; margin: 0; padding: 0; }
+  .control-label { font-family: var(--font-mono); font-size: 10px; color: var(--text-2); letter-spacing: .5px; margin-bottom: 9px; }
+
+  .segment-group { display: flex; border: 1px solid var(--line); border-radius: 3px; overflow: hidden; }
+  .segment-btn {
+    flex: 1; font-family: var(--font-mono); font-size: 11px; padding: 8px 4px;
+    border: none; border-right: 1px solid var(--line); background: var(--bg-2); color: var(--text-1); cursor: pointer;
+  }
+  .segment-btn:last-child { border-right: none; }
+  .segment-btn:hover { color: var(--text-0); }
+  .segment-btn.active { background: var(--amber); color: #1a1200; font-weight: 700; }
+
+  .btn-row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .btn {
+    font-family: var(--font-mono); font-size: 11px; font-weight: 600; padding: 9px 12px;
+    border: 1px solid var(--line); border-radius: 3px; background: var(--bg-2); color: var(--text-0); cursor: pointer;
+  }
+  .btn:hover { border-color: var(--line-2); background: #1c1c1c; }
+  .btn-run { border-color: rgba(16,185,129,.4); color: var(--teal); background: var(--teal-tint); flex: 1; }
+  .btn-hardware { border-color: rgba(245,158,11,.35); color: var(--amber); background: rgba(245,158,11,.06); flex: 1; text-align: left; }
+  .btn-hardware:hover { background: rgba(245,158,11,.14); }
+
+  .param-row { display: grid; grid-template-columns: 1fr 62px; column-gap: 8px; row-gap: 6px; align-items: center; margin-top: 12px; }
+  .param-row:first-of-type { margin-top: 0; }
+  .param-row label { grid-column: 1 / -1; font-family: var(--font-mono); font-size: 10.5px; color: var(--text-1); }
+  .param-row label span { color: var(--text-2); }
+
+  input[type="range"] { -webkit-appearance: none; appearance: none; width: 100%; height: 3px; background: var(--line); border-radius: 2px; }
+  input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; width: 12px; height: 12px; background: var(--amber); cursor: pointer; border-radius: 2px; }
+  input[type="range"]::-moz-range-thumb { width: 12px; height: 12px; background: var(--amber); cursor: pointer; border: none; border-radius: 2px; }
+
+  .num-input {
+    font-family: var(--font-mono); font-size: 11px; color: var(--text-0); background: var(--bg-0);
+    border: 1px solid var(--line); border-radius: 3px; padding: 4px 6px; width: 100%; text-align: right;
+  }
+  .num-input:focus { outline: none; border-color: var(--amber); }
+
+  .footer { text-align: center; font-family: var(--font-mono); font-size: 10px; color: var(--text-2); }
+
+  @media (max-width: 1000px) {
+    .workbench { grid-template-columns: 1fr; grid-template-rows: 300px 260px auto; }
+    .scope-pane { grid-column: 1; grid-row: 1; }
+    .terminal-pane { grid-column: 1; grid-row: 2; }
+    .control-pane { grid-column: 1; grid-row: 3; }
+    .metrics-bar { grid-template-columns: repeat(2, 1fr); }
+  }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <header class="topbar">
+    <div>
+      <span class="brand-mark">SAGE-HAR</span>
+      <span class="brand-sub">gate workbench &middot; client-side simulation</span>
+    </div>
+    <div id="status-chip" class="status-chip inactive">
+      <span class="status-led"></span>
+      <span id="status-text">GATE_INACTIVE</span>
+    </div>
+  </header>
+
+  <!-- Dense tabular metrics bar, htop-style -->
+  <section class="metrics-bar">
+    <div class="metric">
+      <div class="metric-key">SKIP_RATE</div>
+      <div class="metric-val" id="m-skip">0.00%</div>
+    </div>
+    <div class="metric">
+      <div class="metric-key">EST_POWER_SAVED</div>
+      <div class="metric-val teal" id="m-power">0.00%</div>
+    </div>
+    <div class="metric">
+      <div class="metric-key">HAR_CALLS</div>
+      <div class="metric-val" id="m-calls">0 / 0</div>
+    </div>
+    <div class="metric">
+      <div class="metric-key">VAR_REST_BASELINE</div>
+      <div class="metric-val amber" id="m-baseline">0.000100</div>
+    </div>
+    <div class="metric">
+      <div class="metric-key" id="m-accuracy-key">MODEL_ACCURACY</div>
+      <div class="metric-val teal" id="m-accuracy">--</div>
+    </div>
+  </section>
+
+  <!-- Only visible in REAL_MODEL data-source mode: shows the trained
+       CNN's actual prediction for the current window vs. the real
+       UCI-HAR ground-truth label. -->
+  <section class="pane" id="real-status-bar" style="display: none; flex-direction: row; align-items: center; gap: 24px; padding: 10px 14px;">
+    <div><span class="metric-key">TRUE_ACTIVITY</span> <span class="metric-val" id="rs-true" style="font-size: 14px;">--</span></div>
+    <div><span class="metric-key">MODEL_PREDICTION</span> <span class="metric-val" id="rs-pred" style="font-size: 14px;">--</span></div>
+    <div id="rs-verdict" class="status-chip inactive" style="margin-left: auto;"><span class="status-led"></span><span id="rs-verdict-text">--</span></div>
+  </section>
+
+  <!-- Only visible in LIVE data-source mode: real phone accelerometer via
+       the browser DeviceMotion API. No ground truth exists for a live
+       stream, so this shows the model's prediction alone plus sensor
+       connection state -- no MATCH/MISMATCH verdict is possible here. -->
+  <section class="pane" id="live-status-bar" style="display: none; flex-direction: row; align-items: center; gap: 24px; padding: 10px 14px; flex-wrap: wrap;">
+    <div><span class="metric-key">SENSOR_STATE</span> <span class="metric-val" id="ls-state" style="font-size: 14px;">IDLE</span></div>
+    <div><span class="metric-key">EVENTS_RECEIVED</span> <span class="metric-val" id="ls-events" style="font-size: 14px;">0</span></div>
+    <div><span class="metric-key">LIVE_PREDICTION</span> <span class="metric-val teal" id="ls-pred" style="font-size: 14px;">--</span></div>
+    <button id="request-sensor-btn" class="btn btn-hardware" style="margin-left: auto;">[ Request Sensor Access ]</button>
+  </section>
+
+  <main class="workbench">
+
+    <section class="pane scope-pane">
+      <div class="pane-header">
+        <h2>SIGNAL_OSCILLOSCOPE</h2>
+        <div class="legend">
+          <span class="legend-item"><i class="swatch swatch-var"></i>svm_var</span>
+          <span class="legend-item"><i class="swatch swatch-hi"></i>eps_high</span>
+          <span class="legend-item"><i class="swatch swatch-lo"></i>eps_low</span>
+          <span class="legend-item"><i class="swatch swatch-active"></i>gate_active</span>
+        </div>
+      </div>
+      <canvas id="scope"></canvas>
+    </section>
+
+    <section class="pane terminal-pane">
+      <div class="pane-header"><h2>STATE_TRACE</h2></div>
+      <div id="terminal"></div>
+    </section>
+
+    <section class="pane control-pane">
+      <div class="pane-header"><h2>CONTROL_PANEL</h2></div>
+
+      <div class="control-block">
+        <div class="control-label">DATA_SOURCE</div>
+        <div class="segment-group" id="data-source-buttons">
+          <button class="segment-btn active" data-source="synthetic">Synthetic Sim</button>
+          <button class="segment-btn" data-source="real">Real Model Replay</button>
+          <button class="segment-btn" data-source="live">Live Sensor</button>
+        </div>
+        <div id="data-source-note" style="font-family: var(--font-mono); font-size: 10px; color: var(--text-2); margin-top: 8px; line-height: 1.5;">
+          Synthetic: JS-simulated sensor stream, gate logic only.
+        </div>
+      </div>
+
+      <div class="control-block" id="profile-control-block">
+        <div class="control-label">SUBJECT_PROFILE</div>
+        <div class="segment-group" id="profile-buttons">
+          <button class="segment-btn active" data-profile="calm">Calm</button>
+          <button class="segment-btn" data-profile="tremor">Tremor</button>
+          <button class="segment-btn" data-profile="restless">Restless</button>
+        </div>
+      </div>
+
+      <div class="control-block">
+        <div class="control-label">PLAYBACK</div>
+        <div class="btn-row">
+          <button id="play-pause-btn" class="btn btn-run">&#9208; PAUSE</button>
+        </div>
+      </div>
+
+      <div class="control-block">
+        <div class="control-label">HARDWARE_TEST_INJECTORS</div>
+        <div class="btn-row" style="flex-direction: column;">
+          <button id="inject-spike-btn" class="btn btn-hardware">[ Inject Spike ]</button>
+          <button id="reset-baseline-btn" class="btn btn-hardware">[ Reset Baseline ]</button>
+        </div>
+      </div>
+
+      <div class="control-block">
+        <div class="control-label">GATE_PARAMETERS</div>
+
+        <div class="param-row">
+          <label for="alpha-slider">ALPHA <span>(ewma smoothing)</span></label>
+          <input type="range" id="alpha-slider" min="0.01" max="0.20" step="0.01" value="0.05" />
+          <input type="number" id="alpha-number" class="num-input" min="0.01" max="0.20" step="0.01" value="0.05" />
+        </div>
+
+        <div class="param-row">
+          <label for="khigh-slider">K_HIGH <span>(activation)</span></label>
+          <input type="range" id="khigh-slider" min="1.5" max="6.0" step="0.1" value="3.0" />
+          <input type="number" id="khigh-number" class="num-input" min="1.5" max="6.0" step="0.1" value="3.0" />
+        </div>
+
+        <div class="param-row">
+          <label for="klow-slider">K_LOW <span>(deactivation)</span></label>
+          <input type="range" id="klow-slider" min="1.0" max="3.0" step="0.1" value="1.5" />
+          <input type="number" id="klow-number" class="num-input" min="1.0" max="3.0" step="0.1" value="1.5" />
+        </div>
+      </div>
+
+    </section>
+
+  </main>
+
+  <footer class="footer">sage-har reference workbench &middot; single-file (+ 2 generated data/runtime files) &middot; 60fps canvas render loop</footer>
+</div>
+
+<!--
+  ONNX Runtime Web: the only genuinely external dependency in this
+  dashboard, needed to run the REAL trained model (data/processed/
+  har_cnn_uci.onnx) in-browser for the "Real Model Replay" data source.
+  The "Synthetic Sim" data source needs neither this nor web_real_data.js
+  and works fully offline.
+-->
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+
+<!--
+  Generated by generate_real_data_js.py: one real UCI-HAR test subject's
+  window data (REAL_SAMPLE_DATA) + the trained model as base64 ONNX bytes
+  (REAL_MODEL_BASE64). Loaded via a plain <script src> rather than fetch()
+  specifically so this still works when index.html is opened directly as
+  a file:// page (fetch() of local files is blocked by the browser's
+  same-origin policy; a <script src> tag is not).
+-->
+<script src="web_real_data.js"></script>
+
+<script>
+/* =============================================================
+   PART 1: SAGE-HAR gate engine (JavaScript port of sage_gate.py)
+   =============================================================
+   This block is a line-for-line mirror of the Python SageGate class so
+   the two implementations never drift apart. If you change the gate
+   logic here, make the same change in sage_gate.py.
+*/
+
+function makeGateConfig(overrides) {
+  return Object.assign({
+    alpha: 0.05,
+    kHigh: 3.0,
+    kLow: 1.5,
+    epsFloor: 1e-6,
+  }, overrides || {});
+}
+
+function createGate(config) {
+  return {
+    config,
+    status: 'INACTIVE',   // 'INACTIVE' | 'ACTIVE'
+    varRest: 0,
+    windowIndex: 0,
+    warmedUp: false,
+  };
+}
+
+// Step 1: Signal Vector Magnitude -- SVM = sqrt(x^2 + y^2 + z^2)
+function svm(x, y, z) {
+  return Math.sqrt(x * x + y * y + z * z);
+}
+
+// Step 2: population variance of a list of numbers
+function variance(values) {
+  const n = values.length;
+  if (n < 2) return 0;
+  let mean = 0;
+  for (let i = 0; i < n; i++) mean += values[i];
+  mean /= n;
+  let sumSq = 0;
+  for (let i = 0; i < n; i++) {
+    const d = values[i] - mean;
+    sumSq += d * d;
+  }
+  return sumSq / n;
+}
+
+// Steps 3 & 4: rest-filtered EWMA baseline + dual-threshold hysteresis.
+// Advances `gate` by one window and returns a decision record.
+function gateStepVariance(gate, varianceValue) {
+  const statusBefore = gate.status;
+  const cfg = gate.config;
+  let epsHigh, epsLow;
+
+  if (statusBefore === 'INACTIVE') {
+    // Gate closed: this window is trustworthy "resting" data.
+    if (!gate.warmedUp) {
+      // Warm start: snap the baseline to the first real reading instead of
+      // trusting an arbitrary initial guess.
+      gate.varRest = Math.max(varianceValue, cfg.epsFloor);
+      gate.warmedUp = true;
+    } else {
+      gate.varRest = (1 - cfg.alpha) * gate.varRest + cfg.alpha * varianceValue;
+    }
+    const baseline = Math.max(gate.varRest, cfg.epsFloor);
+    epsHigh = cfg.kHigh * baseline;
+    epsLow = cfg.kLow * baseline;
+
+    if (varianceValue > epsHigh) {
+      gate.status = 'ACTIVE';
+    }
+  } else {
+    // Gate open: baseline frozen.
+    const baseline = Math.max(gate.varRest, cfg.epsFloor);
+    epsHigh = cfg.kHigh * baseline;
+    epsLow = cfg.kLow * baseline;
+
+    if (varianceValue < epsLow) {
+      gate.status = 'INACTIVE';
+    }
+  }
+
+  const decision = {
+    windowIndex: gate.windowIndex,
+    variance: varianceValue,
+    varRest: gate.varRest,
+    epsHigh, epsLow,
+    statusBefore,
+    statusAfter: gate.status,
+    runModel: gate.status === 'ACTIVE',
+    transitioned: statusBefore !== gate.status,
+  };
+  gate.windowIndex += 1;
+  return decision;
+}
+
+/* =============================================================
+   PART 2: Synthetic sensor simulator
+   ============================================================= */
+
+const PROFILES = {
+  calm:     { label: 'Calm',    restStd: 0.015, amp: 2.2, activeChance: 0.02, restBout: [40, 120], activeBout: [15, 45] },
+  tremor:   { label: 'Tremor',  restStd: 0.12,  amp: 1.8, activeChance: 0.03, restBout: [30, 90],  activeBout: [10, 35] },
+  restless: { label: 'Restless',restStd: 0.05,  amp: 2.6, activeChance: 0.10, restBout: [10, 35],  activeBout: [20, 70] },
+};
+const WINDOW_LEN = 40;
+
+function randInt(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
+function gaussian(std) {
+  const u1 = Math.max(Math.random(), 1e-12);
+  const u2 = Math.random();
+  return Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2) * std;
+}
+
+const sim = {
+  profileKey: 'calm',
+  profile: PROFILES.calm,
+  isActive: false,
+  bout: randInt(...PROFILES.calm.restBout),
+  phase: 0,
+  spikeWindows: 0,
+  gate: createGate(makeGateConfig()),
+  windowsSeen: 0,
+  harCalls: 0,
+};
+
+function setProfile(key) {
+  sim.profileKey = key;
+  sim.profile = PROFILES[key];
+  sim.isActive = false;
+  sim.bout = randInt(...sim.profile.restBout);
+  sim.phase = 0;
+  sim.spikeWindows = 0;
+  sim.gate = createGate(sim.gate.config);
+  sim.windowsSeen = 0;
+  sim.harCalls = 0;
+  history.length = 0;
+  terminal.innerHTML = '';
+}
+
+function injectSpike() {
+  sim.spikeWindows = randInt(15, 28);
+}
+
+function resetBaseline() {
+  // Force the gate to re-warm its resting baseline from scratch, as if
+  // recalibrating on fresh ground truth -- handy after a parameter change
+  // or a long noisy stretch has pushed var_rest somewhere undesirable.
+  sim.gate.warmedUp = false;
+  sim.gate.status = 'INACTIVE';
+}
+
+function generateSample() {
+  const forcedActive = sim.spikeWindows > 0 || sim.isActive;
+  if (forcedActive) {
+    sim.phase += 0.35;
+    const amp = sim.spikeWindows > 0 ? sim.profile.amp * 1.4 : sim.profile.amp;
+    return [
+      amp * Math.sin(sim.phase) + gaussian(amp * 0.15),
+      amp * Math.cos(sim.phase * 0.7) + gaussian(amp * 0.15),
+      1.0 + amp * 0.3 * Math.sin(sim.phase * 1.3) + gaussian(amp * 0.15),
+    ];
+  }
+  const s = sim.profile.restStd;
+  return [gaussian(s), gaussian(s), 1.0 + gaussian(s)];
+}
+
+function stepWindow() {
+  if (sim.spikeWindows > 0) {
+    sim.spikeWindows -= 1;
+  } else {
+    sim.bout -= 1;
+    if (sim.bout <= 0) {
+      if (sim.isActive) {
+        sim.isActive = false;
+        sim.bout = randInt(...sim.profile.restBout);
+      } else if (Math.random() < sim.profile.activeChance * WINDOW_LEN) {
+        sim.isActive = true;
+        sim.bout = randInt(...sim.profile.activeBout);
+      } else {
+        sim.bout = randInt(...sim.profile.restBout);
+      }
+    }
+  }
+
+  const svmValues = new Array(WINDOW_LEN);
+  let sumSvm = 0;
+  for (let i = 0; i < WINDOW_LEN; i++) {
+    const [x, y, z] = generateSample();
+    const v = svm(x, y, z);
+    svmValues[i] = v;
+    sumSvm += v;
+  }
+  const meanSvm = sumSvm / WINDOW_LEN;
+  const varianceValue = variance(svmValues);
+
+  const decision = gateStepVariance(sim.gate, varianceValue);
+  decision.svmMean = meanSvm;
+
+  sim.windowsSeen += 1;
+  if (decision.runModel) sim.harCalls += 1;
+  decision.windowsSeen = sim.windowsSeen;
+  decision.harCalls = sim.harCalls;
+
+  return decision;
+}
+
+/* =============================================================
+   PART 3: Wiring -- DOM refs, canvas rendering, terminal log,
+   metrics, and control panel event handlers.
+   ============================================================= */
+
+const canvas = document.getElementById('scope');
+const ctx = canvas.getContext('2d');
+const terminal = document.getElementById('terminal');
+
+const statusChip = document.getElementById('status-chip');
+const statusText = document.getElementById('status-text');
+const mSkip = document.getElementById('m-skip');
+const mPower = document.getElementById('m-power');
+const mCalls = document.getElementById('m-calls');
+const mBaseline = document.getElementById('m-baseline');
+
+const MAX_POINTS = 280;
+const history = [];
+
+let dpr = window.devicePixelRatio || 1;
+function resizeCanvas() {
+  const rect = canvas.getBoundingClientRect();
+  dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.max(1, Math.round(rect.width * dpr));
+  canvas.height = Math.max(1, Math.round(rect.height * dpr));
+}
+window.addEventListener('resize', resizeCanvas);
+
+function drawGrid(w, h) {
+  ctx.strokeStyle = 'rgba(255,255,255,0.05)';
+  ctx.lineWidth = 1;
+  ctx.setLineDash([1 * dpr, 3 * dpr]);
+  for (let i = 1; i < 12; i++) {
+    const x = Math.round((w / 12) * i) + 0.5;
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
+  }
+  for (let i = 1; i < 6; i++) {
+    const y = Math.round((h / 6) * i) + 0.5;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+  }
+  ctx.setLineDash([]);
+}
+
+function drawScope() {
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+  drawGrid(w, h);
+
+  if (history.length >= 2) {
+    let maxVal = 1e-6;
+    for (const pt of history) maxVal = Math.max(maxVal, pt.variance, pt.epsHigh, pt.epsLow);
+    maxVal *= 1.15;
+
+    const padTop = 8 * dpr, padBottom = 8 * dpr;
+    const plotH = h - padTop - padBottom;
+    const stepX = w / (MAX_POINTS - 1);
+    const offset = MAX_POINTS - history.length;
+    const yFor = (v) => padTop + plotH - (v / maxVal) * plotH;
+    const xFor = (i) => (offset + i) * stepX;
+
+    // active-region tint + transition marker lines
+    let bandStart = null;
+    for (let i = 0; i < history.length; i++) {
+      const active = history[i].runModel;
+      if (active && bandStart === null) bandStart = i;
+      if ((!active || i === history.length - 1) && bandStart !== null) {
+        const end = active ? i : i - 1;
+        ctx.fillStyle = 'rgba(16, 185, 129, 0.08)';
+        ctx.fillRect(xFor(bandStart), padTop, xFor(end) + stepX - xFor(bandStart), plotH);
+        bandStart = null;
+      }
+    }
+    for (let i = 0; i < history.length; i++) {
+      if (history[i].transitioned) {
+        const x = Math.round(xFor(i)) + 0.5;
+        ctx.strokeStyle = history[i].statusAfter === 'ACTIVE' ? '#10b981' : '#3b82f6';
+        ctx.lineWidth = 1 * dpr;
+        ctx.setLineDash([]);
+        ctx.beginPath(); ctx.moveTo(x, padTop); ctx.lineTo(x, padTop + plotH); ctx.stroke();
+      }
+    }
+
+    const drawLine = (key, color, width, dash) => {
+      ctx.strokeStyle = color;
+      ctx.lineWidth = width * dpr;
+      ctx.setLineDash(dash ? dash.map((v) => v * dpr) : []);
+      ctx.beginPath();
+      history.forEach((pt, i) => {
+        const x = xFor(i), y = yFor(pt[key]);
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+      ctx.setLineDash([]);
+    };
+    drawLine('epsHigh', '#ef4444', 1.25, [5, 3]);
+    drawLine('epsLow', '#3b82f6', 1.25, [5, 3]);
+    drawLine('variance', '#f59e0b', 1.6, null);
+  }
+
+  requestAnimationFrame(drawScope);
+}
+
+const MAX_LOG_LINES = 400;
+let logCount = 0;
+function fmt(n, d) { return Number(n).toFixed(d); }
+
+function appendLog(d, realInfo) {
+  const line = document.createElement('div');
+  line.className = 'log-line';
+  let html = `<span class="log-dim">[WIN ${String(d.windowIndex).padStart(5, '0')}]</span> `
+    + `SVM: <span class="log-amber">${fmt(d.svmMean, 3)}</span> `
+    + `<span class="log-dim">|</span> Var: <span class="log-amber">${fmt(d.variance, 5)}</span> `
+    + `<span class="log-dim">|</span> eps_hi: <span class="log-red">${fmt(d.epsHigh, 5)}</span> `
+    + `<span class="log-dim">|</span> eps_lo: <span class="log-blue">${fmt(d.epsLow, 5)}</span>`;
+
+  if (realInfo && realInfo.trueName) {
+    // Real Model Replay: ground truth exists, so color the prediction by
+    // whether it matched.
+    const verdictColor = realInfo.correct ? 'log-amber' : 'log-red';
+    html += ` <span class="log-dim">|</span> TRUE: ${realInfo.trueName}`
+      + ` <span class="log-dim">|</span> PRED: <span class="${verdictColor}">${realInfo.predName}</span>`
+      + (realInfo.calledModel ? ` <span class="tag">[CNN CALLED]</span>` : ``);
+  } else if (realInfo) {
+    // Live Sensor: no ground truth for a live stream, so just show the
+    // prediction -- never color it as if it had been verified.
+    html += ` <span class="log-dim">|</span> PRED: <span class="log-amber">${realInfo.predName}</span>`
+      + (realInfo.calledModel ? ` <span class="tag">[CNN CALLED]</span>` : ``);
+  }
+
+  if (d.transitioned) {
+    if (d.statusAfter === 'ACTIVE') {
+      line.classList.add('activate');
+      html += ` <span class="tag">-&gt; TRANSITION: GATE ACTIVE</span>`;
+    } else {
+      line.classList.add('deactivate');
+      html += ` <span class="tag">-&gt; TRANSITION: GATE INACTIVE</span>`;
+    }
+  }
+  line.innerHTML = html;
+  terminal.appendChild(line);
+  logCount += 1;
+  if (logCount > MAX_LOG_LINES) { terminal.removeChild(terminal.firstChild); logCount -= 1; }
+  terminal.scrollTop = terminal.scrollHeight;
+}
+
+function estimatePowerSavedPct(windows, harCalls) {
+  if (windows === 0) return 0;
+  const HAR = 1.0, GATE = 0.015, IDLE = 0.001;
+  const skipped = windows - harCalls;
+  const gated = harCalls * (HAR + GATE) + skipped * (GATE + IDLE);
+  const alwaysOn = windows * HAR;
+  return Math.max(0, 1 - gated / alwaysOn) * 100;
+}
+
+const mAccuracy = document.getElementById('m-accuracy');
+
+function updateMetrics(d, accuracyPct) {
+  const skipRate = d.windowsSeen === 0 ? 0 : (1 - d.harCalls / d.windowsSeen) * 100;
+  mSkip.textContent = fmt(skipRate, 2) + '%';
+  mPower.textContent = fmt(estimatePowerSavedPct(d.windowsSeen, d.harCalls), 2) + '%';
+  mCalls.textContent = `${d.harCalls} / ${d.windowsSeen}`;
+  mBaseline.textContent = fmt(d.varRest, 6);
+  mAccuracy.textContent = accuracyPct === undefined ? '--' : fmt(accuracyPct, 1) + '%';
+
+  if (d.statusAfter === 'ACTIVE') {
+    statusChip.classList.replace('inactive', 'active');
+    statusText.textContent = 'GATE_ACTIVE';
+  } else {
+    statusChip.classList.replace('active', 'inactive');
+    statusText.textContent = 'GATE_INACTIVE';
+  }
+}
+
+// --- main tick loop: advances the simulation, independent of rendering ---
+let running = true;
+const TICK_MS = 80;
+setInterval(() => {
+  // dataSource is declared further down (PART 4), but by the time this
+  // callback actually fires the whole synchronous script has already run
+  // once, so the binding exists -- see the note there.
+  //
+  // This check matters: without it, this loop kept running in the
+  // background even while "Real Model Replay" was selected (it only ever
+  // checked `running`, never the mode), silently advancing the synthetic
+  // simulation and calling updateMetrics(d) with no accuracy argument --
+  // which stomped the real mode's MODEL_ACCURACY display back to '--'
+  // every 80ms, racing against and beating the real tick's slower 220ms
+  // updates almost every time.
+  if (!running || dataSource !== 'synthetic') return;
+  const d = stepWindow();
+  history.push(d);
+  if (history.length > MAX_POINTS) history.shift();
+  appendLog(d);
+  updateMetrics(d);
+}, TICK_MS);
+
+// --- control panel wiring ---
+document.getElementById('play-pause-btn').addEventListener('click', (e) => {
+  running = !running;
+  e.target.innerHTML = running ? '&#9208; PAUSE' : '&#9654; RUN';
+});
+
+document.getElementById('inject-spike-btn').addEventListener('click', injectSpike);
+document.getElementById('reset-baseline-btn').addEventListener('click', resetBaseline);
+
+// Scoped to #profile-buttons specifically -- #data-source-buttons below
+// also uses the .segment-btn class for the same visual style, and an
+// unscoped `.segment-btn` selector here would wire both groups together
+// (clicking a data-source button would deactivate profile buttons and
+// vice versa, and `btn.dataset.profile` would be undefined for
+// data-source buttons).
+document.querySelectorAll('#profile-buttons .segment-btn').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('#profile-buttons .segment-btn').forEach((b) => b.classList.remove('active'));
+    btn.classList.add('active');
+    setProfile(btn.dataset.profile);
+  });
+});
+
+function syncPair(sliderId, numberId, decimals, onChange) {
+  const slider = document.getElementById(sliderId);
+  const number = document.getElementById(numberId);
+  slider.addEventListener('input', () => {
+    const v = parseFloat(slider.value);
+    number.value = v.toFixed(decimals);
+    onChange(v);
+  });
+  number.addEventListener('change', () => {
+    let v = parseFloat(number.value);
+    if (Number.isNaN(v)) v = parseFloat(slider.value);
+    v = Math.min(parseFloat(slider.max), Math.max(parseFloat(slider.min), v));
+    slider.value = v;
+    number.value = v.toFixed(decimals);
+    onChange(v);
+  });
+}
+// Both gate instances share the SAME config object (createGate(sim.gate.config)
+// below), so a single slider edit tunes whichever mode -- synthetic or real
+// -- happens to be active. This mirrors setProfile()'s own `sim.gate =
+// createGate(sim.gate.config)`, which already relies on that object surviving
+// profile switches.
+syncPair('alpha-slider', 'alpha-number', 2, (v) => { sim.gate.config.alpha = v; });
+syncPair('khigh-slider', 'khigh-number', 1, (v) => { sim.gate.config.kHigh = v; });
+syncPair('klow-slider', 'klow-number', 1, (v) => { sim.gate.config.kLow = v; });
+
+/* =============================================================
+   PART 4: Real Model Replay -- the actual trained CNN
+   =============================================================
+   Everything above is a synthetic simulation. This block instead replays
+   one real UCI-HAR test subject's window data (REAL_SAMPLE_DATA, from
+   generate_real_data_js.py) through the SAME gate logic above, calling
+   the REAL trained model (REAL_MODEL_BASE64, an ONNX export of
+   data/processed/har_cnn_uci.pt) via onnxruntime-web whenever the gate
+   says to. This is the in-browser mirror of evaluate_real.py -- same
+   heartbeat fix, same "window 0 always forces a real call" fix (see
+   evaluate_real.py's comments for why both exist).
+*/
+
+const REAL_HEARTBEAT = 10;       // matches evaluate_real.py's DEFAULT_HEARTBEAT_WINDOWS
+const REAL_TICK_MS = 220;        // slower than the synthetic sim's 80ms -- real
+                                  // inference takes real time, and this stays watchable
+
+let dataSource = 'synthetic';
+let realSession = null;
+let realSessionLoadPromise = null;
+let realGate = null;
+let realIndex = 0;
+let realWindowsSince = 0;
+let realHarCalls = 0;
+let realWindowsSeen = 0;
+let realCorrect = 0;
+let realLastPred = null;
+
+const realStatusBar = document.getElementById('real-status-bar');
+const liveStatusBar = document.getElementById('live-status-bar');
+const dataSourceNote = document.getElementById('data-source-note');
+const profileControlBlock = document.getElementById('profile-control-block');
+const injectorsBlock = document.getElementById('inject-spike-btn').closest('.control-block');
+const rsTrue = document.getElementById('rs-true');
+const rsPred = document.getElementById('rs-pred');
+const rsVerdict = document.getElementById('rs-verdict');
+const rsVerdictText = document.getElementById('rs-verdict-text');
+
+function resetRealPlayback() {
+  realGate = createGate(sim.gate.config);   // same shared config object -- see note above
+  realIndex = 0;
+  realWindowsSince = 0;
+  realHarCalls = 0;
+  realWindowsSeen = 0;
+  realCorrect = 0;
+  realLastPred = null;
+  history.length = 0;
+  terminal.innerHTML = '';
+  logCount = 0;
+}
+
+function base64ToUint8Array(b64) {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+function ensureRealSessionLoaded() {
+  if (realSession) return Promise.resolve(realSession);
+  if (realSessionLoadPromise) return realSessionLoadPromise;
+
+  realSessionLoadPromise = (async () => {
+    if (typeof ort === 'undefined') {
+      throw new Error('onnxruntime-web failed to load from the CDN -- check your internet connection.');
+    }
+    const modelBytes = base64ToUint8Array(REAL_MODEL_BASE64);
+    realSession = await ort.InferenceSession.create(modelBytes);
+    return realSession;
+  })();
+
+  return realSessionLoadPromise;
+}
+
+function argmax(float32array) {
+  let best = 0;
+  for (let i = 1; i < float32array.length; i++) {
+    if (float32array[i] > float32array[best]) best = i;
+  }
+  return best;
+}
+
+// window: [xArr(128), yArr(128), zArr(128)] -> Float32Array laid out as
+// [x0..x127, y0..y127, z0..z127], matching PyTorch's (channels, window_len)
+// row-major memory layout for a (1, 3, 128) input tensor.
+function windowToTensorData(window) {
+  const out = new Float32Array(3 * 128);
+  out.set(window[0], 0);
+  out.set(window[1], 128);
+  out.set(window[2], 256);
+  return out;
+}
+
+async function processOneRealWindow() {
+  const window = REAL_SAMPLE_DATA.windows[realIndex];
+  const trueLabel = REAL_SAMPLE_DATA.labels[realIndex];
+
+  const svmValues = new Array(128);
+  for (let j = 0; j < 128; j++) svmValues[j] = svm(window[0][j], window[1][j], window[2][j]);
+  const varianceValue = variance(svmValues);
+
+  const decision = gateStepVariance(realGate, varianceValue);
+  realWindowsSince += 1;
+
+  // Trigger a real CNN call if: the gate says ACTIVE, OR the heartbeat
+  // timer expired, OR no prediction has ever been made yet (cold start --
+  // see evaluate_real.py's ground-truth-leak fix for why this can't just
+  // default to some placeholder instead).
+  const heartbeatDue = realWindowsSince >= REAL_HEARTBEAT;
+  const coldStart = realLastPred === null;
+  const calledModel = decision.runModel || heartbeatDue || coldStart;
+
+  let predLabel;
+  if (calledModel) {
+    const session = await ensureRealSessionLoaded();
+    const tensorData = windowToTensorData(window);
+    const feeds = {};
+    feeds[session.inputNames[0]] = new ort.Tensor('float32', tensorData, [1, 3, 128]);
+    const results = await session.run(feeds);
+    const logits = results[session.outputNames[0]].data;
+    predLabel = argmax(logits);
+
+    realLastPred = predLabel;
+    realHarCalls += 1;
+    realWindowsSince = 0;
+  } else {
+    predLabel = realLastPred;
+  }
+
+  realWindowsSeen += 1;
+  const correct = predLabel === trueLabel;
+  if (correct) realCorrect += 1;
+
+  const d = {
+    windowIndex: realIndex,
+    svmMean: svmValues.reduce((a, b) => a + b, 0) / svmValues.length,
+    variance: decision.variance,
+    varRest: decision.varRest,
+    epsHigh: decision.epsHigh,
+    epsLow: decision.epsLow,
+    runModel: decision.runModel,
+    transitioned: decision.transitioned,
+    statusAfter: decision.statusAfter,
+    windowsSeen: realWindowsSeen,
+    harCalls: realHarCalls,
+  };
+
+  history.push(d);
+  if (history.length > MAX_POINTS) history.shift();
+  appendLog(d, {
+    trueName: REAL_ACTIVITY_NAMES[trueLabel],
+    predName: REAL_ACTIVITY_NAMES[predLabel],
+    correct,
+    calledModel,
+  });
+  updateMetrics(d, (realCorrect / realWindowsSeen) * 100);
+
+  rsTrue.textContent = REAL_ACTIVITY_NAMES[trueLabel];
+  rsPred.textContent = REAL_ACTIVITY_NAMES[predLabel];
+  rsVerdict.classList.toggle('active', correct);
+  rsVerdict.classList.toggle('inactive', !correct);
+  rsVerdictText.textContent = correct ? 'MATCH' : 'MISMATCH';
+
+  realIndex = (realIndex + 1) % REAL_SAMPLE_DATA.windows.length;  // loop the subject's stream
+}
+
+async function realTick() {
+  if (dataSource === 'real' && running) {
+    try {
+      await processOneRealWindow();
+    } catch (err) {
+      dataSourceNote.textContent = 'Error: ' + err.message;
+      dataSourceNote.style.color = 'var(--red)';
+    }
+  }
+  setTimeout(realTick, REAL_TICK_MS);
+}
+
+/* =============================================================
+   PART 5: Live Sensor -- real phone accelerometer via DeviceMotion
+   =============================================================
+   Uses the browser's DeviceMotion API (window 'devicemotion' events,
+   event.accelerationIncludingGravity) so this can run on an actual real
+   sensor stream, not just replayed data. Same gate + heartbeat + real CNN
+   logic as PART 4, but with two real-world differences:
+
+     - No ground truth exists for a live stream, so there is no accuracy
+       figure and no MATCH/MISMATCH verdict here -- only a prediction.
+     - Sample rate is whatever the device/browser delivers (there is no
+       fixed 50Hz guarantee the way UCI-HAR/MotionSense were recorded),
+       so a 128-sample window here covers however long that many events
+       actually took to arrive, not a fixed 2.56s. This is disclosed in
+       the UI rather than papered over.
+
+   iOS 13+ requires an explicit user-gesture-triggered permission request
+   (DeviceMotionEvent.requestPermission()) before 'devicemotion' fires at
+   all; Android and desktop browsers with a sensor generally don't need
+   this and just start delivering events once you're listening. Desktop
+   browsers and this dashboard's own automated-testing environment have
+   no accelerometer hardware at all -- expect SENSOR_STATE to land on
+   NO_DATA_RECEIVED there, which is the honest, correct outcome, not a bug.
+*/
+
+const LIVE_WINDOW_LEN = 128;  // matches the trained model's expected input length
+
+let liveGate = null;
+let liveBuffer = [];
+let liveHarCalls = 0;
+let liveWindowsSeen = 0;
+let liveWindowsSince = 0;
+let liveLastPred = null;
+let liveEventCount = 0;
+let liveProcessing = false;
+let liveListenerAttached = false;
+let liveNoDataTimeout = null;
+
+const lsState = document.getElementById('ls-state');
+const lsEvents = document.getElementById('ls-events');
+const lsPred = document.getElementById('ls-pred');
+
+function setLiveState(text) { lsState.textContent = text; }
+
+function resetLivePlayback() {
+  liveGate = createGate(sim.gate.config);  // same shared config object as sim/realGate
+  liveBuffer = [];
+  liveHarCalls = 0;
+  liveWindowsSeen = 0;
+  liveWindowsSince = 0;
+  liveLastPred = null;
+  liveEventCount = 0;
+  history.length = 0;
+  terminal.innerHTML = '';
+  logCount = 0;
+  lsEvents.textContent = '0';
+  lsPred.textContent = '--';
+  setLiveState('IDLE');
+}
+
+function onDeviceMotion(event) {
+  const acc = event.accelerationIncludingGravity;
+  if (!acc || acc.x === null || acc.x === undefined) return;  // some browsers fire empty events
+
+  liveEventCount += 1;
+  lsEvents.textContent = String(liveEventCount);
+  setLiveState('STREAMING');
+
+  liveBuffer.push([acc.x || 0, acc.y || 0, acc.z || 0]);
+  if (liveBuffer.length >= LIVE_WINDOW_LEN && !liveProcessing) {
+    const chunk = liveBuffer.splice(0, LIVE_WINDOW_LEN);
+    liveProcessing = true;
+    processLiveWindow(chunk).finally(() => { liveProcessing = false; });
+  }
+}
+
+async function processLiveWindow(chunk) {
+  const xArr = chunk.map((s) => s[0]);
+  const yArr = chunk.map((s) => s[1]);
+  const zArr = chunk.map((s) => s[2]);
+
+  const svmValues = new Array(chunk.length);
+  for (let j = 0; j < chunk.length; j++) svmValues[j] = svm(xArr[j], yArr[j], zArr[j]);
+  const varianceValue = variance(svmValues);
+
+  const decision = gateStepVariance(liveGate, varianceValue);
+  liveWindowsSince += 1;
+
+  const heartbeatDue = liveWindowsSince >= REAL_HEARTBEAT;
+  const coldStart = liveLastPred === null;
+  const calledModel = decision.runModel || heartbeatDue || coldStart;
+
+  let predLabel = liveLastPred;
+  let modelError = null;
+  if (calledModel) {
+    try {
+      const session = await ensureRealSessionLoaded();
+      const tensorData = windowToTensorData([xArr, yArr, zArr]);
+      const feeds = {};
+      feeds[session.inputNames[0]] = new ort.Tensor('float32', tensorData, [1, 3, 128]);
+      const results = await session.run(feeds);
+      const logits = results[session.outputNames[0]].data;
+      predLabel = argmax(logits);
+      liveLastPred = predLabel;
+      liveHarCalls += 1;
+      liveWindowsSince = 0;
+    } catch (err) {
+      modelError = err;  // gate still ran fine; just no classification this window
+    }
+  }
+
+  liveWindowsSeen += 1;
+
+  const d = {
+    windowIndex: liveWindowsSeen - 1,
+    svmMean: svmValues.reduce((a, b) => a + b, 0) / svmValues.length,
+    variance: decision.variance,
+    varRest: decision.varRest,
+    epsHigh: decision.epsHigh,
+    epsLow: decision.epsLow,
+    runModel: decision.runModel,
+    transitioned: decision.transitioned,
+    statusAfter: decision.statusAfter,
+    windowsSeen: liveWindowsSeen,
+    harCalls: liveHarCalls,
+  };
+
+  history.push(d);
+  if (history.length > MAX_POINTS) history.shift();
+
+  if (predLabel !== null) {
+    const predName = REAL_ACTIVITY_NAMES[predLabel];
+    appendLog(d, { predName, calledModel });
+    lsPred.textContent = predName;
+  } else {
+    appendLog(d);
+    if (modelError) lsPred.textContent = 'MODEL_UNAVAILABLE';
+  }
+  updateMetrics(d, undefined);  // no ground truth on a live stream -> no accuracy figure
+}
+
+async function requestSensorAccess() {
+  if (typeof DeviceMotionEvent === 'undefined') {
+    setLiveState('UNSUPPORTED');
+    dataSourceNote.textContent = 'This browser does not expose the DeviceMotion API at all.';
+    dataSourceNote.style.color = 'var(--red)';
+    return;
+  }
+
+  if (typeof DeviceMotionEvent.requestPermission === 'function') {
+    // iOS 13+ requires this to be called synchronously from within a user
+    // gesture handler -- it is here, since this only runs from the button's
+    // click listener.
+    setLiveState('REQUESTING_PERMISSION');
+    try {
+      const result = await DeviceMotionEvent.requestPermission();
+      if (result === 'granted') {
+        startListening();
+      } else {
+        setLiveState('PERMISSION_DENIED');
+      }
+    } catch (err) {
+      setLiveState('ERROR');
+      dataSourceNote.textContent = 'Error requesting sensor permission: ' + err.message;
+      dataSourceNote.style.color = 'var(--red)';
+    }
+  } else {
+    // Android / desktop-with-sensor / pre-iOS-13: no explicit permission
+    // step exists -- just start listening and see if events actually show up.
+    startListening();
+  }
+}
+
+function startListening() {
+  if (liveListenerAttached) return;
+  window.addEventListener('devicemotion', onDeviceMotion);
+  liveListenerAttached = true;
+  setLiveState('WAITING_FOR_DATA');
+  clearTimeout(liveNoDataTimeout);
+  liveNoDataTimeout = setTimeout(() => {
+    if (liveEventCount === 0) {
+      setLiveState('NO_DATA_RECEIVED');
+      dataSourceNote.textContent = 'No accelerometer events arrived after 3s. This needs a real '
+        + 'device with a motion sensor -- most desktop browsers (and this dashboard\'s own '
+        + 'automated test environment) have none, which is the expected, correct outcome here.';
+      dataSourceNote.style.color = 'var(--red)';
+    }
+  }, 3000);
+}
+
+function stopListening() {
+  if (!liveListenerAttached) return;
+  window.removeEventListener('devicemotion', onDeviceMotion);
+  liveListenerAttached = false;
+  clearTimeout(liveNoDataTimeout);
+}
+
+document.getElementById('request-sensor-btn').addEventListener('click', requestSensorAccess);
+
+document.querySelectorAll('#data-source-buttons .segment-btn').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('#data-source-buttons .segment-btn').forEach((b) => b.classList.remove('active'));
+    btn.classList.add('active');
+    dataSource = btn.dataset.source;
+
+    // Leaving live mode should stop the sensor listener regardless of
+    // which mode is being entered.
+    if (dataSource !== 'live') stopListening();
+
+    if (dataSource === 'real') {
+      profileControlBlock.style.display = 'none';
+      injectorsBlock.style.display = 'none';
+      realStatusBar.style.display = 'flex';
+      liveStatusBar.style.display = 'none';
+      dataSourceNote.textContent = 'Real: UCI-HAR test subject #' + REAL_SAMPLE_DATA.subject_id
+        + ' (' + REAL_SAMPLE_DATA.windows.length + ' windows, looping) + real trained CNN via onnxruntime-web. Loading model...';
+      dataSourceNote.style.color = 'var(--text-2)';
+      resetRealPlayback();
+      ensureRealSessionLoaded()
+        .then(() => { dataSourceNote.textContent = 'Real: UCI-HAR test subject #' + REAL_SAMPLE_DATA.subject_id + ', model loaded and running.'; })
+        .catch((err) => { dataSourceNote.textContent = 'Error: ' + err.message; dataSourceNote.style.color = 'var(--red)'; });
+    } else if (dataSource === 'live') {
+      profileControlBlock.style.display = 'none';
+      injectorsBlock.style.display = 'none';
+      realStatusBar.style.display = 'none';
+      liveStatusBar.style.display = 'flex';
+      dataSourceNote.textContent = 'Live: real phone accelerometer via DeviceMotion + real trained CNN. '
+        + 'Click "Request Sensor Access" below -- requires a device with a motion sensor.';
+      dataSourceNote.style.color = 'var(--text-2)';
+      resetLivePlayback();
+      ensureRealSessionLoaded().catch(() => {});  // pre-warm; errors surface per-window instead
+    } else {
+      profileControlBlock.style.display = '';
+      injectorsBlock.style.display = '';
+      realStatusBar.style.display = 'none';
+      liveStatusBar.style.display = 'none';
+      dataSourceNote.textContent = 'Synthetic: JS-simulated sensor stream, gate logic only.';
+      dataSourceNote.style.color = 'var(--text-2)';
+      history.length = 0;
+      terminal.innerHTML = '';
+      logCount = 0;
+    }
+  });
+});
+
+// --- boot ---
+resizeCanvas();
+requestAnimationFrame(drawScope);
+realTick();
+</script>
+</body>
+</html>
